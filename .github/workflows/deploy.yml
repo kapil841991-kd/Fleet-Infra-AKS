@@ -96,7 +96,7 @@ jobs:
         uses: infracost/actions/setup@v3
         with:
           # Hardcoded key nikal kar GitHub Secrets me dalna best practice h
-          api-key: ${{ secrets.INFRACOST_API_KEY }} 
+          api-key: ico-bjjsUNbF5NSCVN5pUaG7WY2QKu1M7z5c
       - name: Run Breakdown
         run: infracost breakdown --path . --format html --out-file infracost-report.html
       - name: Publish Infracost Report
