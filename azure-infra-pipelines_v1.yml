@@ -1,0 +1,178 @@
+trigger: none
+
+pool: kapil-pool
+
+stages:
+  - stage: Terraform  
+    displayName: Terraform Install Init Validate Plan
+    jobs:
+      - job: InfraCheck
+        displayName: Terraform Install Init Validate Plan
+        steps:
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: 'latest'
+
+          - task: TerraformTask@5
+            displayName: terraform init
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/Infra-AKS'
+              backendServiceArm: 'ops-scn'
+              backendAzureRmOverrideSubscriptionID: 'f8bb19d2-fa1c-44e1-b99d-f92784561646'
+              backendAzureRmResourceGroupName: 'RG-DO-NOT-DELETE'
+              backendAzureRmStorageAccountName: 'fleetstorage1'
+              backendAzureRmContainerName: 'container1'
+              backendAzureRmKey: 'aks-cluster.tfstate'
+
+          - task: TerraformTask@5
+            displayName: terraform validate
+            inputs:
+              provider: 'azurerm'
+              command: 'validate'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/Infra-AKS'
+
+          - task: TerraformTask@5
+            displayName: terraform plan
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: '$(System.DefaultWorkingDirectory)/Infra-AKS'
+              environmentServiceNameAzureRM: 'ops-scn'
+              environmentAzureRmOverrideSubscriptionID: 'f8bb19d2-fa1c-44e1-b99d-f92784561646'
+
+  - stage: InfraScanning
+    displayName: 'Infra Scanning (TFLint)'
+    dependsOn: 
+      - Terraform
+    jobs:
+    - job: RunTFLint
+      displayName: 'TFLint Code Scan'
+      steps:
+      - bash: |
+          echo "Downloading and installing TFLint..."
+          curl -sL https://github.com/terraform-linters/tflint/releases/latest/download/tflint_linux_amd64.zip -o tflint.zip
+          unzip tflint.zip
+          chmod +x tflint
+          mv tflint /usr/local/bin/
+          tflint --version
+        displayName: 'Install TFLint'
+
+      - bash: |
+          echo "Initializing TFLint..."
+          cd $(System.DefaultWorkingDirectory)/Infra-AKS
+          tflint --init
+
+          echo "Running TFLint scan and generating report..."
+          # JUnit xml generate kar rahe hain report ke liye (|| true lagaya h taaki error aane pe script aage badhe aur report publish ho)
+          tflint --format junit > $(Common.TestResultsDirectory)/tflint-report.xml || true
+          
+          # Console me dekhne ke liye normal run
+          tflint -f compact
+        displayName: 'Run TFLint Scan'
+
+# NAYA TASK: Report Publish Karne Ke Liye
+      - task: PublishTestResults@2
+        displayName: 'Publish TFLint Report'
+        inputs:
+          testResultsFormat: 'JUnit'
+          testResultsFiles: '**/tflint-report.xml'
+          searchFolder: '$(Common.TestResultsDirectory)'
+          testRunTitle: 'TFLint Code Quality Scan'
+          mergeTestResults: true
+
+  - stage: SecurityScan
+    displayName: "Security Scan (Checkov)"
+    dependsOn: 
+      - Terraform
+    jobs:
+    - job: CheckovJob
+      displayName: "Run Checkov"
+      steps:
+      - bash: |
+          echo "Installing Checkov..."
+          pip3 install --upgrade pip
+          pip3 install checkov
+        displayName: "Install Checkov"
+
+      - bash: |
+          echo "Running Checkov Scan..."
+          cd $(System.DefaultWorkingDirectory)/Infra-AKS
+          
+          # Checkov se JUnit report banayenge
+          checkov -d . --soft-fail --output junitxml > $(Common.TestResultsDirectory)/checkov-report.xml
+        displayName: "Run Checkov Scan & Generate Report"
+
+      # NAYA TASK: Report Publish Karne Ke Liye
+      - task: PublishTestResults@2
+        displayName: 'Publish Checkov Report'
+        inputs:
+          testResultsFormat: 'JUnit'
+          testResultsFiles: '**/checkov-report.xml'
+          searchFolder: '$(Common.TestResultsDirectory)'
+          testRunTitle: 'Checkov Security Scan'
+          mergeTestResults: true
+
+  - stage: CostAnalysis
+    displayName: 'Cost Analysis (Infracost)'
+    dependsOn: 
+      - InfraScanning
+    jobs:
+    - job: InfracostJob
+      displayName: 'Infracost Cost Analysis'
+      steps:
+      - task: InfracostSetup@2
+        displayName: 'Setup Infracost'
+        inputs:
+          apiKey: ico-bjjsUNbF5NSCVN5pUaG7WY2QKu1M7z5c
+          version: 'latest'
+
+      - bash: |
+          echo "Running Infracost Breakdown..."
+          cd $(System.DefaultWorkingDirectory)/Infra-AKS
+          infracost breakdown --path . --format html --out-file infracost-report.html
+        displayName: 'Run Infracost Breakdown'
+
+      - task: PublishPipelineArtifact@1
+        displayName: 'Publish Infracost Report'
+        inputs:
+          targetPath: '$(System.DefaultWorkingDirectory)/Infra-AKS/infracost-report.html'
+          artifact: 'InfracostReport'
+
+  - stage: TerraformApply
+    displayName: Terraform Apply
+    dependsOn: 
+      - SecurityScan
+      - CostAnalysis
+      - InfraScanning
+    jobs:
+    - job: Apply
+      steps:
+
+                - task: TerraformInstaller@1
+                  inputs:
+                    terraformVersion: 'latest'
+
+                - task: TerraformTask@5
+                  displayName: terraform init
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'init'
+                    workingDirectory: '$(System.DefaultWorkingDirectory)/Infra-AKS'
+                    backendServiceArm: 'ops-scn'
+                    backendAzureRmOverrideSubscriptionID: 'f8bb19d2-fa1c-44e1-b99d-f92784561646'
+                    backendAzureRmResourceGroupName: 'RG-DO-NOT-DELETE'
+                    backendAzureRmStorageAccountName: 'fleetstorage1'
+                    backendAzureRmContainerName: 'container1'
+                    backendAzureRmKey: 'aks-cluster.tfstate'
+
+                - task: TerraformTask@5
+                  displayName: terraform apply
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'apply'
+                    workingDirectory: '$(System.DefaultWorkingDirectory)/Infra-AKS'
+                    commandOptions: '-auto-approve'
+                    environmentServiceNameAzureRM: 'ops-scn'
+                    environmentAzureRmOverrideSubscriptionID: 'f8bb19d2-fa1c-44e1-b99d-f92784561646'
