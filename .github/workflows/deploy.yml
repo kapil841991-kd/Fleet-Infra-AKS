@@ -3,6 +3,7 @@ name: 'Terraform Infra Pipeline'
 on:
   push:
     branches: [ "main" ]
+  workflow_dispatch: # Manual trigger ke liye
 
 permissions:
   id-token: write
@@ -15,70 +16,131 @@ env:
   ARM_USE_OIDC: true
 
 jobs:
-  infra-deployment:
-    name: 'Terraform, Scans & Deploy'
+  # ==========================================
+  # STAGE 1: PLAN
+  # ==========================================
+  terraform-plan:
+    name: 'Terraform Init & Plan'
     runs-on: ubuntu-latest
-    
-    defaults:
-      run:
-        working-directory: '.' # Kyunki screenshot ke hisaab se code root folder me hai
-
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
-    - name: Azure Login via OIDC
-      uses: azure/login@v2
-      with:
-        client-id: ${{ secrets.AZURE_CLIENT_ID }}
-        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Azure Login via OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.ARM_CLIENT_ID }}
+          tenant-id: ${{ env.ARM_TENANT_ID }}
+          subscription-id: ${{ env.ARM_SUBSCRIPTION_ID }}
 
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v3
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
 
-    - name: Terraform Init
-      run: |
-        terraform init \
-          -backend-config="resource_group_name=RG-DO-NOT-DELETE" \
-          -backend-config="storage_account_name=fleetstorage1" \
-          -backend-config="container_name=container1" \
-          -backend-config="key=aks-cluster.tfstate"
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=RG-DO-NOT-DELETE" \
+            -backend-config="storage_account_name=fleetstorage1" \
+            -backend-config="container_name=container1" \
+            -backend-config="key=aks-cluster.tfstate"
 
-    - name: Terraform Validate
-      run: terraform validate
+      - name: Terraform Validate
+        run: terraform validate
 
-    - name: Terraform Plan
-      run: terraform plan -out=tfplan
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan
 
-    - name: TFLint Code Scan
-      run: |
-        curl -sL https://github.com/terraform-linters/tflint/releases/latest/download/tflint_linux_amd64.zip -o tflint.zip
-        unzip tflint.zip
-        sudo mv tflint /usr/local/bin/
-        tflint --init
-        tflint -f compact
+      # Plan file ko save kar rahe hain taaki Apply stage isko use kar sake
+      - name: Upload Terraform Plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: tfplan
+          retention-days: 1
 
-    - name: Checkov Security Scan
-      run: |
-        pip3 install checkov
-        checkov -d . --soft-fail
+  # ==========================================
+  # STAGE 2: PARALLEL SCANS
+  # ==========================================
+  tflint-scan:
+    name: 'TFLint Code Scan'
+    runs-on: ubuntu-latest
+    needs: terraform-plan # ADO ke 'dependsOn' jaisa
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run TFLint
+        run: |
+          curl -sL https://github.com/terraform-linters/tflint/releases/latest/download/tflint_linux_amd64.zip -o tflint.zip
+          unzip tflint.zip
+          sudo mv tflint /usr/local/bin/
+          tflint --init
+          tflint -f compact
 
-    - name: Setup Infracost
-      uses: infracost/actions/setup@v3
-      with:
-        api-key: ico-bjjsUNbF5NSCVN5pUaG7WY2QKu1M7z5c
+  checkov-scan:
+    name: 'Checkov Security Scan'
+    runs-on: ubuntu-latest
+    needs: terraform-plan
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Checkov
+        run: |
+          pip3 install checkov
+          checkov -d . --soft-fail
 
-    - name: Run Infracost Breakdown
-      run: infracost breakdown --path . --format html --out-file infracost-report.html
+  infracost-analysis:
+    name: 'Infracost Analysis'
+    runs-on: ubuntu-latest
+    needs: terraform-plan
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v3
+        with:
+          # Hardcoded key nikal kar GitHub Secrets me dalna best practice h
+          api-key: ${{ secrets.INFRACOST_API_KEY }} 
+      - name: Run Breakdown
+        run: infracost breakdown --path . --format html --out-file infracost-report.html
+      - name: Publish Infracost Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: InfracostReport
+          path: infracost-report.html
 
-    - name: Publish Infracost Report
-      uses: actions/upload-artifact@v4
-      with:
-        name: InfracostReport
-        path: infracost-report.html
+  # ==========================================
+  # STAGE 3: APPLY
+  # ==========================================
+  terraform-apply:
+    name: 'Terraform Apply'
+    runs-on: ubuntu-latest
+    # Apply tabhi chalega jab ye teeno jobs successfully pass ho jayenge
+    needs: [tflint-scan, checkov-scan, infracost-analysis] 
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
 
-    - name: Terraform Apply
-      # Sirf 'main' branch me push hone par hi apply chalega
-      if: github.ref == 'refs/heads/main'
-      run: terraform apply -auto-approve tfplan
+      - name: Azure Login via OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.ARM_CLIENT_ID }}
+          tenant-id: ${{ env.ARM_TENANT_ID }}
+          subscription-id: ${{ env.ARM_SUBSCRIPTION_ID }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=RG-DO-NOT-DELETE" \
+            -backend-config="storage_account_name=fleetstorage1" \
+            -backend-config="container_name=container1" \
+            -backend-config="key=aks-cluster.tfstate"
+
+      # Plan stage se 'tfplan' file wapas download kar rahe hain
+      - name: Download Terraform Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
